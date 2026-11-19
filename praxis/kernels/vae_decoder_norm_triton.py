@@ -26,7 +26,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
+from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -60,7 +60,7 @@ def _decoder_norm_silu(
         other=0,
     ).to(tl.float32)
     squared = tl.sum(value * value, axis=1)
-    denominator = tl.maximum(libdevice.sqrt_rn(squared), 1.0e-12)
+    denominator = tl.maximum(tl.sqrt_rn(squared), 1.0e-12)
     weight = tl.load(gamma + channel, channel < C, other=0).to(tl.float32)
     normalized = ((value / denominator[:, None]) * SCALE) * weight[None, :] + 0.0
     result = normalized / (1.0 + libdevice.exp(-normalized))
