@@ -24,6 +24,7 @@ of the expert outputs (``_PermuteRows``) and the chunked expert dispatch
 from __future__ import annotations
 
 import importlib.util
+import os
 from collections.abc import Callable, Generator, Sequence
 from functools import partial
 from typing import Any, Literal
@@ -54,6 +55,10 @@ AttentionBackend = Literal["triton", "flash", "cudnn"]
 # One compiled flex-attention callable for the whole process. The eager
 # flex_attention falls back to a dense kernel that does not fit long sequences.
 _compiled_flex_attention = torch.compile(flex_attention)
+# ROCm: the statically specialised kernel memory-faults for some first-call
+# sequence lengths (Inductor flex template); the shape-polymorphic one does not.
+if torch.version.hip and os.environ.get("PRAXIS_ROCM_FLEX_DYNAMIC") == "1":
+    _compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
 # Shape-polymorphic twin for callers whose sequence lengths change from call to
 # call (the action expert in the "flex_dynamic" mode). It has its own compile
 # cache, so its entries do not count against the static one.
@@ -435,6 +440,9 @@ PAIR_BUFFER = True
 # the roundings of the stock combine, the shared add, the residual add and the norm, same bits). Anywhere else the
 # tail is materialized with the stock kernels. Default off.
 MOE_TAIL_NORM = False
+# ROCm: torch._grouped_mm runs one hipBLASLt GEMM per expert, so the chunked routed path uses the
+# Triton grouped GEMMs there. PRAXIS_ROCM_TRITON_MOE_GEMM=0 keeps torch._grouped_mm.
+ROCM_TRITON_MOE_GEMM = os.environ.get("PRAXIS_ROCM_TRITON_MOE_GEMM", "1") == "1"
 # data_ptr of the MoE feed-forward inputs yielded by TransformerBlock.forward_gen (MOE_TAIL_NORM), and whether the
 # MoE call in progress may return MoETail objects.
 _TAIL_INPUTS: set[int] = set()
@@ -1389,8 +1397,13 @@ def _routed_chunk(
             top_idx, gate, gate_up_w.shape[0]
         )
         rows = x[sorted_tokens].to(gate_up_w.dtype)
-    gate_up = torch._grouped_mm(rows, gate_up_w, offsets)
-    expert_out = torch._grouped_mm(_expert_swiglu(gate_up), down_w, offsets)
+    if fast and ROCM_TRITON_MOE_GEMM and torch.version.hip and not torch.is_grad_enabled():
+        from praxis.kernels.moe_gemm_triton import grouped_gate_up_swiglu, grouped_mm
+
+        expert_out = grouped_mm(grouped_gate_up_swiglu(rows, gate_up_w, offsets), down_w, offsets)
+    else:
+        gate_up = torch._grouped_mm(rows, gate_up_w, offsets)
+        expert_out = torch._grouped_mm(_expert_swiglu(gate_up), down_w, offsets)
     if fast:
         return moe_chunked_combine(
             expert_out, sorted_gate, inverse, top_k, scaling, shared=shared, out=out
