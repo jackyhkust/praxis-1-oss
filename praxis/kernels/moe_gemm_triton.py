@@ -24,7 +24,7 @@ import torch
 import triton
 import triton.language as tl
 from torch import Tensor
-from triton.language.extra.cuda import libdevice
+from triton.language.extra import libdevice
 
 DEFAULT_CONFIG = {
     "BM": 128,
@@ -143,6 +143,9 @@ def grouped_mm(
     if not fast:
         return torch._grouped_mm(x, w, offsets)
     cfg = {**DEFAULT_CONFIG, **(config or {})}
+    if torch.version.hip:
+        # 160 KiB LDS on gfx950: 4-stage 128x256x64 tiles need ~200 KiB.
+        cfg["num_stages"] = min(cfg["num_stages"], 2)
     m, k = x.shape
     e, _, n = w.shape
     out = x.new_empty(m, n)
@@ -318,6 +321,9 @@ def grouped_gate_up_swiglu(
     ``order``, ``r[i] = x[order[i] // top_k]`` (``rows`` = len(order)).
     ``act=1``: ``F.silu(gate) * up`` instead (the shared expert's rounding)."""
     cfg = {**SWIGLU_CONFIG, **(config or {})}
+    if torch.version.hip:
+        # 160 KiB LDS on gfx950: 4-stage 128x256x64 tiles need ~200 KiB.
+        cfg["num_stages"] = min(cfg["num_stages"], 2)
     m = x.shape[0] if order is None else (rows if rows is not None else order.numel())
     k = x.shape[1]
     e, _, n2 = w.shape
