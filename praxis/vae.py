@@ -95,6 +95,15 @@ VAE_ENCODE_GRAPH_MAX = 8
 
 logger = logging.getLogger(__name__)
 
+# ROCm: PyTorch runs channels-last 3-D convolutions natively in MIOpen only with
+# PYTORCH_MIOPEN_SUGGEST_NHWC=1, read at the first convolution of the process; without it every
+# convolution converts its input to NCDHW and its output back. MIOpen's immediate-mode heuristic
+# also picks slow solvers for the encoder shapes, so the fused encoder runs its convolutions
+# under MIOpen find (cudnn.benchmark). PRAXIS_ROCM_VAE_MIOPEN_FIND=0 keeps both off.
+ROCM_VAE_MIOPEN_FIND = os.environ.get("PRAXIS_ROCM_VAE_MIOPEN_FIND", "1") == "1"
+if torch.version.hip and ROCM_VAE_MIOPEN_FIND:
+    os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
+
 
 def _keep(t: Tensor) -> Tensor:
     """A fused-encoder cache entry: ``t`` itself (ENCODER_CACHE_VIEWS) or a clone."""
@@ -879,6 +888,16 @@ class FusedEncoder:
         return x + shortcut
 
     def _forward(self, buf: Tensor, caches: Caches) -> Tensor:
+        if not (torch.version.hip and ROCM_VAE_MIOPEN_FIND) or torch.compiler.is_compiling():
+            return self._forward_convs(buf, caches)
+        benchmark = torch.backends.cudnn.benchmark
+        torch.backends.cudnn.benchmark = True
+        try:
+            return self._forward_convs(buf, caches)
+        finally:
+            torch.backends.cudnn.benchmark = benchmark
+
+    def _forward_convs(self, buf: Tensor, caches: Caches) -> Tensor:
         enc = self.enc
         i = caches.next_index()
         caches.items[i] = _keep(buf[:, :, -CACHE_T:])
